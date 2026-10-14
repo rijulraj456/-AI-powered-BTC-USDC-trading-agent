@@ -1,0 +1,155 @@
+pip install ccxt pandas numpy python-dotenv
+# Optional for better indicators: pip install pandas-ta
+# Optional for LLM: pip install openai  (or your preferred client)
+import ccxt
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuration
+SYMBOL = 'BTC/USDC'          # or 'BTC/USDT' if preferred
+EXCHANGE_ID = 'binance'      # or 'coinbase', 'bybit', 'kraken', etc.
+TIMEFRAME = '1h'
+LIMIT = 100                  # candles
+INITIAL_USDC = 10000.0
+RISK_PER_TRADE = 0.02        # 2% of portfolio max risk (example)
+DRY_RUN = True               # Always start True
+
+class BTCUSDCAgent:
+    def __init__(self):
+        self.exchange = getattr(ccxt, EXCHANGE_ID)({
+            'enableRateLimit': True,
+            # 'apiKey': os.getenv('API_KEY'),
+            # 'secret': os.getenv('API_SECRET'),
+        })
+        self.cash = INITIAL_USDC          # USDC balance
+        self.btc = 0.0                    # BTC holdings
+        self.trades = []
+        self.equity_curve = []
+
+    def fetch_data(self):
+        ohlcv = self.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        return df
+
+    def compute_indicators(self, df):
+        # Simple indicators (extend with pandas-ta or TA-Lib for more)
+        df['sma_20'] = df['close'].rolling(20).mean()
+        df['sma_50'] = df['close'].rolling(50).mean()
+        # RSI (basic implementation)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        return df
+
+    def get_market_summary(self, df):
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        price = latest['close']
+        sma20 = latest['sma_20']
+        sma50 = latest['sma_50']
+        rsi = latest['rsi']
+        trend = "bullish" if sma20 > sma50 else "bearish"
+        return {
+            'price': round(price, 2),
+            'rsi': round(rsi, 2) if not np.isnan(rsi) else None,
+            'sma20': round(sma20, 2) if not np.isnan(sma20) else None,
+            'sma50': round(sma50, 2) if not np.isnan(sma50) else None,
+            'trend': trend,
+            'change_1h': round((price - prev['close']) / prev['close'] * 100, 2)
+        }
+
+    def build_llm_prompt(self, summary, portfolio_value):
+        return f"""You are a cautious crypto trading agent for BTC/USDC.
+Current market summary:
+- Price: ${summary['price']}
+- RSI(14): {summary['rsi']}
+- SMA20: {summary['sma20']}
+- SMA50: {summary['sma50']}
+- Trend: {summary['trend']}
+- 1h change: {summary['change_1h']}%
+
+Portfolio: ${portfolio_value:.2f} total value (cash + BTC holdings).
+
+Rules:
+- Prefer HOLD unless clear edge.
+- Never risk more than ~2% of portfolio on a single idea.
+- Consider overbought/oversold and trend.
+- Output ONLY a JSON-like decision: {{"action": "BUY"|"SELL"|"HOLD", "confidence": 0-1, "reason": "short explanation", "suggested_usdc_amount": number or null}}
+
+Decision:"""
+
+    def decide(self, summary, portfolio_value):
+        """
+        Placeholder decision logic. Replace this with a real LLM call.
+        Example with OpenAI (uncomment and add key):
+        from openai import OpenAI
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": self.build_llm_prompt(summary, portfolio_value)}],
+            temperature=0.2
+        )
+        # Parse response.choices[0].message.content as JSON
+        """
+        # Simple rule-based fallback for demo
+        if summary['rsi'] and summary['rsi'] < 30 and summary['trend'] == 'bullish':
+            return {"action": "BUY", "confidence": 0.65, "reason": "RSI oversold + bullish trend", "suggested_usdc_amount": portfolio_value * 0.05}
+        elif summary['rsi'] and summary['rsi'] > 70:
+            return {"action": "SELL", "confidence": 0.6, "reason": "RSI overbought", "suggested_usdc_amount": None}
+        else:
+            return {"action": "HOLD", "confidence": 0.5, "reason": "No clear edge", "suggested_usdc_amount": None}
+
+    def get_portfolio_value(self, price):
+        return self.cash + self.btc * price
+
+    def execute_paper(self, decision, price):
+        action = decision['action']
+        if action == 'BUY' and self.cash > 10:
+            amount_usdc = min(decision.get('suggested_usdc_amount') or self.cash * 0.05, self.cash * 0.1)
+            btc_amount = amount_usdc / price
+            self.cash -= amount_usdc
+            self.btc += btc_amount
+            self.trades.append({'time': datetime.utcnow(), 'side': 'BUY', 'btc': btc_amount, 'price': price, 'usdc': amount_usdc})
+            print(f"PAPER BUY: {btc_amount:.6f} BTC @ ${price:.2f}")
+        elif action == 'SELL' and self.btc > 0.0001:
+            usdc_received = self.btc * price
+            self.cash += usdc_received
+            sold_btc = self.btc
+            self.btc = 0
+            self.trades.append({'time': datetime.utcnow(), 'side': 'SELL', 'btc': sold_btc, 'price': price, 'usdc': usdc_received})
+            print(f"PAPER SELL: {sold_btc:.6f} BTC @ ${price:.2f}")
+        else:
+            print("HOLD — no action")
+
+    def run_once(self):
+        print(f"\n=== {datetime.utcnow()} | BTC/USDC Agent Cycle ===")
+        df = self.fetch_data()
+        df = self.compute_indicators(df)
+        summary = self.get_market_summary(df)
+        price = summary['price']
+        port_value = self.get_portfolio_value(price)
+        print(f"Market: {summary}")
+        print(f"Portfolio: ${port_value:.2f} (Cash: ${self.cash:.2f}, BTC: {self.btc:.6f})")
+
+        decision = self.decide(summary, port_value)
+        print(f"Decision: {decision}")
+
+        if DRY_RUN:
+            self.execute_paper(decision, price)
+        else:
+            print("LIVE MODE NOT ENABLED — implement real order placement carefully")
+
+        self.equity_curve.append({'time': datetime.utcnow(), 'value': self.get_portfolio_value(price)})
+        return decision
+
+if __name__ == "__main__":
+    agent = BTCUSDCAgent()
